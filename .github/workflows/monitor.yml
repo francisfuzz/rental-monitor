@@ -59,7 +59,7 @@ jobs:
         id: config
         run: |
           python3 - <<'PYEOF'
-          import yaml, os, re
+          import yaml, os, re as _re
 
           # Load the YAML config file from the root of the repository.
           with open('monitor-config.yml') as f:
@@ -70,9 +70,11 @@ jobs:
           price_caps = cfg.get('price_caps', {})
           bedrooms   = str(cfg.get('bedrooms', '2:3'))
 
-          # Escape each street name before joining so regex metacharacters in names
-          # like "St. James Pl." are treated as literals, not regex operators.
-          street_regex = '|'.join(re.escape(str(s)) for s in streets)
+          # Escape only jq/oniguruma metacharacters in each street name (e.g. the dot
+          # in "St. James Pl."). Spaces are excluded from escaping because oniguruma
+          # does not reliably treat backslash-space as a literal space match.
+          _ONIG_META = _re.compile(r'([.^$*+?()[\]{}|\\])')
+          street_regex = '|'.join(_ONIG_META.sub(r'\\\1', str(s)) for s in streets)
 
           # Build a jq boolean expression from price_caps, e.g.
           # "(.bedrooms == 2 and .price <= 5500) or (.bedrooms == 3 and .price <= 6000)".

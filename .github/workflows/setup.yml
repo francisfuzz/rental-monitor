@@ -1,0 +1,206 @@
+# This workflow validates your monitor-config.yml and checks that the required API key
+# secret is set; it opens a GitHub Issue with a fix checklist when either check fails.
+name: Setup Validation
+
+on:
+  # Trigger automatically whenever monitor-config.yml is pushed to main so config
+  # mistakes are caught immediately on the first meaningful commit.
+  push:
+    branches: [main]
+    paths:
+      - 'monitor-config.yml'
+  # Also allow a manual run from the Actions tab to re-validate after fixing a problem.
+  # See: https://docs.github.com/en/actions/using-workflows/manually-running-a-workflow
+  workflow_dispatch:
+
+jobs:
+  validate:
+    # Spin up a fresh GitHub-hosted Ubuntu virtual machine for this job.
+    runs-on: ubuntu-latest
+    # Only needs permission to open issues — no file writes are required.
+    # See: https://docs.github.com/en/actions/security-guides/automatic-token-authentication
+    permissions:
+      issues: write
+
+    steps:
+      # Copy the repository files onto the runner so the validation script can read
+      # monitor-config.yml.
+      # See: https://github.com/actions/checkout
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Parse monitor-config.yml with yq and verify that all four required fields
+      # are present and correctly formatted; results are written to $GITHUB_OUTPUT.
+      # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-output-parameter
+      - name: Validate monitor-config.yml
+        id: validate_config
+        run: |
+          set -euo pipefail
+
+          ERRORS=()
+
+          # yq exits non-zero on YAML syntax errors; redirect stderr to suppress noise here.
+          # A parse failure is itself added to ERRORS so it shows up in the checklist issue.
+          if ! yq '.' monitor-config.yml > /dev/null 2>&1; then
+            ERRORS+=('Could not parse monitor-config.yml: invalid YAML syntax')
+          else
+
+            # Check each required field individually so the issue names every problem at once.
+            ZIP_CODE=$(yq '.zip_code // ""' monitor-config.yml)
+            if [ -z "$ZIP_CODE" ]; then
+              ERRORS+=('Missing required field: `zip_code`')
+            fi
+
+            # yq's type filter returns "array" for YAML sequences, "null" for missing fields,
+            # and "string"/"number" for non-list values that would silently pass a length check.
+            STREETS_TYPE=$(yq '.streets | type' monitor-config.yml)
+            STREETS_COUNT=$(yq '.streets | length' monitor-config.yml)
+            if [ "$STREETS_TYPE" = "null" ]; then
+              ERRORS+=('Missing required field: `streets`')
+            elif [ "$STREETS_TYPE" != "array" ] || [ "$STREETS_COUNT" -eq 0 ]; then
+              ERRORS+=('`streets` must be a non-empty list')
+            else
+              # An empty-string entry produces an empty regex that matches every address —
+              # every listing in the ZIP would pass the street filter.
+              while IFS= read -r street; do
+                if [ -z "$street" ]; then
+                  ERRORS+=('`streets` contains an empty entry — remove or replace it')
+                fi
+              done < <(yq '.streets[]' monitor-config.yml)
+            fi
+
+            # Each key must end in "br" and each value must be numeric; the monitor
+            # workflow interpolates values directly into a jq expression, so a
+            # non-numeric value produces a jq syntax error at runtime.
+            PRICE_CAPS_COUNT=$(yq '.price_caps | length' monitor-config.yml)
+            if [ "$PRICE_CAPS_COUNT" -eq 0 ]; then
+              ERRORS+=('Missing required field: `price_caps`')
+            else
+              while IFS= read -r key; do
+                case "$key" in
+                  *br)
+                    # The prefix must be a non-negative integer; a key like "abr" strips to
+                    # "a", producing `.bedrooms == a` in jq which is a syntax error at runtime.
+                    prefix="${key%br}"
+                    if ! printf '%s' "$prefix" | grep -qE '^[0-9]+$'; then
+                      ERRORS+=("\`price_caps\` key \"$key\" must have a numeric prefix (e.g. 2br, 3br)")
+                    fi
+                    ;;
+                  *) ERRORS+=("\`price_caps\` key \"$key\" must end in \"br\" (e.g. 2br, 3br)") ;;
+                esac
+                val=$(yq ".price_caps.\"$key\"" monitor-config.yml)
+                if ! printf '%s' "$val" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+                  ERRORS+=("\`price_caps\` value for \"$key\" must be a number, got $val")
+                fi
+              done < <(yq '.price_caps | keys | .[]' monitor-config.yml)
+            fi
+
+            BEDROOMS_VAL=$(yq '.bedrooms // ""' monitor-config.yml)
+            if [ -z "$BEDROOMS_VAL" ]; then
+              ERRORS+=('Missing required field: `bedrooms`')
+            fi
+
+          fi
+
+          # Write has_errors (true/false) and the error list to $GITHUB_OUTPUT; a random
+          # delimiter prevents any error message text from accidentally closing the block.
+          # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+          if [ "${#ERRORS[@]}" -eq 0 ]; then
+            echo "has_errors=false" >> "$GITHUB_OUTPUT"
+            echo 'Config validation passed.'
+          else
+            echo "has_errors=true" >> "$GITHUB_OUTPUT"
+            DELIM=$(openssl rand -hex 8)
+            {
+              echo "errors<<$DELIM"
+              for e in "${ERRORS[@]}"; do printf '- %s\n' "$e"; done
+              echo "$DELIM"
+            } >> "$GITHUB_OUTPUT"
+            # Emit ::error:: annotations so each problem is highlighted inline in the run log.
+            # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message
+            for e in "${ERRORS[@]}"; do printf '::error::%s\n' "$e" >&2; done
+          fi
+
+      # Check whether the RENTCAST_API_KEY secret has been added to the repository by
+      # mapping it to an environment variable — GitHub resolves a missing secret to an
+      # empty string, so an empty variable means the secret is not set.
+      - name: Check API key
+        id: check_key
+        env:
+          RENTCAST_API_KEY: ${{ secrets.RENTCAST_API_KEY }}
+        run: |
+          if [ -z "$RENTCAST_API_KEY" ]; then
+            echo "api_key_missing=true" >> "$GITHUB_OUTPUT"
+            # ::warning:: prints a yellow banner in the run log without failing the job,
+            # so the issue-opening step below still runs.
+            echo "::warning::RENTCAST_API_KEY secret is not set"
+          else
+            echo "api_key_missing=false" >> "$GITHUB_OUTPUT"
+            echo "RENTCAST_API_KEY secret is set."
+          fi
+
+      # Create the "setup" issue label if it does not already exist — only when there is
+      # actually something wrong, so clean setups never have a stray label created.
+      - name: Ensure setup label exists
+        if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "setup" \
+            --color "e4e669" \
+            --description "Setup required" \
+            --force
+
+      # Open a GitHub Issue with a step-by-step checklist for every problem found above.
+      # The body is written to a temp file and passed with --body-file to avoid CLI length
+      # limits and shell-quoting issues with multi-line markdown content.
+      - name: Open setup checklist issue
+        if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_ERRORS: ${{ steps.validate_config.outputs.errors }}
+          API_KEY_MISSING: ${{ steps.check_key.outputs.api_key_missing }}
+        run: |
+          set -euo pipefail
+
+          BODY_FILE=$(mktemp /tmp/setup_issue_body.XXXXXX.md)
+          trap 'rm -f "$BODY_FILE"' EXIT
+
+          # Build the issue body, adding a section only for each problem that was found.
+          # printf is used instead of echo to avoid platform differences with \n handling.
+          {
+            printf '## Setup Required\n\n'
+            printf 'Your rental monitor needs attention before it can run.\n\n'
+
+            # Add API key instructions only when the secret is actually missing.
+            if [ "$API_KEY_MISSING" = "true" ]; then
+              printf '### Missing API Key\n\n'
+              printf '- [ ] Add your Rentcast API key as a repository secret named `RENTCAST_API_KEY`\n'
+              printf '  1. Go to **Settings → Secrets and variables → Actions → New repository secret**\n'
+              printf '  2. Name: `RENTCAST_API_KEY`\n'
+              printf '  3. Value: your key from [app.rentcast.io](https://app.rentcast.io/app/api)\n\n'
+            fi
+
+            # Include the exact validation errors so users know precisely what to fix.
+            if [ -n "$CONFIG_ERRORS" ]; then
+              printf '### Config Errors in `monitor-config.yml`\n\n'
+              printf '%s\n\n' "$CONFIG_ERRORS"
+              printf 'Edit `monitor-config.yml` to fix these issues, then push.\n\n'
+            fi
+
+            printf '---\n'
+            printf 'Once all items are resolved, push a change to `monitor-config.yml` or re-run this workflow to validate again.\n'
+          } > "$BODY_FILE"
+
+          gh issue create \
+            --title 'Setup required: rental monitor needs configuration' \
+            --body-file "$BODY_FILE" \
+            --label 'setup'
+
+      # Print a confirmation message when every check passes so the run log clearly shows
+      # the monitor is fully configured and ready for its first scheduled run.
+      - name: Validation passed
+        if: steps.validate_config.outputs.has_errors == 'false' && steps.check_key.outputs.api_key_missing == 'false'
+        run: |
+          echo "All checks passed. Your rental monitor is ready to run."
+          echo "Trigger the monitor workflow manually or wait for the next scheduled run."

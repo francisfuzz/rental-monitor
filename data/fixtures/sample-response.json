@@ -1,0 +1,80 @@
+[
+  {
+    "id": "fixture-001",
+    "addressLine1": "100 Newport Coast Dr",
+    "city": "Newport Coast",
+    "state": "CA",
+    "zipCode": "92657",
+    "bedrooms": 2,
+    "bathrooms": 2,
+    "squareFootage": 1200,
+    "price": 4800,
+    "status": "Active",
+    "listingUrl": "https://example.com/listing/fixture-001"
+  },
+  {
+    "id": "fixture-002",
+    "addressLine1": "250 Crystal Cove",
+    "city": "Newport Coast",
+    "state": "CA",
+    "zipCode": "92657",
+    "bedrooms": 3,
+    "bathrooms": 2,
+    "squareFootage": 1600,
+    "price": 5900,
+    "status": "Active",
+    "listingUrl": "https://example.com/listing/fixture-002"
+  },
+  {
+    "id": "fixture-003",
+    "addressLine1": "500 Pelican Hill Rd",
+    "city": "Newport Coast",
+    "state": "CA",
+    "zipCode": "92657",
+    "bedrooms": 2,
+    "bathrooms": 1,
+    "squareFootage": 950,
+    "price": 5500,
+    "status": "Active",
+    "listingUrl": "https://example.com/listing/fixture-003"
+  },
+  {
+    "id": "fixture-004-over-cap",
+    "addressLine1": "75 Vista Ridge Ln",
+    "city": "Newport Coast",
+    "state": "CA",
+    "zipCode": "92657",
+    "bedrooms": 2,
+    "bathrooms": 2,
+    "squareFootage": 1100,
+    "price": 5700,
+    "status": "Active",
+    "listingUrl": "https://example.com/listing/fixture-004"
+  },
+  {
+    "id": "fixture-005-wrong-street",
+    "addressLine1": "1000 Pacific Coast Hwy",
+    "city": "Newport Coast",
+    "state": "CA",
+    "zipCode": "92657",
+    "bedrooms": 3,
+    "bathrooms": 2,
+    "squareFootage": 1800,
+    "price": 5500,
+    "status": "Active",
+    "listingUrl": "https://example.com/listing/fixture-005"
+  },
+  {
+    "id": "fixture-006-over-3br-cap",
+    "addressLine1": "300 Reef Point",
+    "city": "Newport Coast",
+    "state": "CA",
+    "zipCode": "92657",
+    "bedrooms": 3,
+    "bathrooms": 2,
+    "squareFootage": 1700,
+    "price": 6100,
+    "status": "Active",
+    "listingUrl": "https://example.com/listing/fixture-006"
+  }
+]

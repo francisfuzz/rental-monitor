@@ -1,0 +1,25 @@
+# Rental Monitor Configuration
+# Edit these values, then push — no workflow editing required.
+
+# ZIP code to search for rental listings.
+# Example: "92657" for Newport Coast, CA
+zip_code: "92657"
+
+# Street names to watch. Case-insensitive substring match.
+# Add or remove entries to match your target neighborhood.
+streets:
+  - Newport Coast Dr
+  - Crystal Cove
+  - Pelican Hill
+  - Reef Point
+  - Vista Ridge
+  - Sage Hill
+
+# Maximum monthly rent per bedroom count.
+# Remove a bedroom count to skip that filter tier entirely.
+price_caps:
+  2br: 5500
+  3br: 6000
+
+# Bedroom range for the Rentcast API query (min:max or exact number).
+bedrooms: "2:3"

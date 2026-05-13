@@ -1,0 +1,423 @@
+# This workflow fetches active rental listings from Rentcast daily, filters them by your
+# configured streets and price caps, and opens a GitHub Issue for every new find.
+name: Rental Monitor
+
+on:
+  # Run automatically on a schedule — by default once a day at 8 AM Pacific time.
+  schedule:
+    # Cron syntax is: minute hour day-of-month month day-of-week (all in UTC).
+    # 15:00 UTC = 8 AM PDT (UTC-7). Use https://crontab.guru/ to change the time.
+    - cron: '0 15 * * *'
+  # Also allow anyone with write access to trigger the workflow by hand from the Actions tab.
+  # See: https://docs.github.com/en/actions/using-workflows/manually-running-a-workflow
+  workflow_dispatch:
+    inputs:
+      zip_code:
+        # Temporarily search a different ZIP code for this one run without editing the config.
+        # Leave blank to use the zip_code value from monitor-config.yml.
+        description: 'Override zip code from monitor-config.yml (optional)'
+        required: false
+        default: ''
+      dry_run:
+        # When true, matches are printed to the run log but no issue is opened and
+        # seen-listings.json is not updated — safe for testing your config.
+        description: 'Log matches without opening issues or updating seen-listings.json'
+        required: false
+        type: boolean
+        default: false
+
+# Prevent two runs of this workflow from executing at the same time.
+# cancel-in-progress: false means a new run waits for the current one to finish rather than
+# cancelling it, so data commits are never interrupted mid-write.
+# See: https://docs.github.com/en/actions/using-jobs/using-concurrency
+concurrency:
+  group: rental-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    # Spin up a fresh GitHub-hosted Ubuntu virtual machine for this job.
+    runs-on: ubuntu-latest
+    # Declare exactly what this workflow is allowed to do in the repository.
+    # contents: write lets it commit data files; issues: write lets it open digest issues.
+    # See: https://docs.github.com/en/actions/security-guides/automatic-token-authentication
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      # Copy the repository's files onto the runner so later steps can read
+      # monitor-config.yml and data/seen-listings.json.
+      # See: https://github.com/actions/checkout
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Read monitor-config.yml with yq and convert its four fields into step outputs
+      # that the rest of the workflow can reference as ${{ steps.config.outputs.<name> }}.
+      # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-output-parameter
+      - name: Parse config
+        id: config
+        run: |
+          set -euo pipefail
+
+          ZIP_CODE=$(yq '.zip_code // ""' monitor-config.yml)
+          if [ -z "$ZIP_CODE" ]; then
+            echo "ERROR: zip_code is missing in monitor-config.yml — run the Setup Validation workflow." >&2
+            exit 1
+          fi
+          BEDROOMS=$(yq '.bedrooms // ""' monitor-config.yml)
+          [ -z "$BEDROOMS" ] && BEDROOMS="2:3"
+
+          # Escape only oniguruma metacharacters in each street name (e.g. the dot in
+          # "St. James Pl."), then join with | as the alternation operator.
+          # Spaces are intentionally NOT escaped — oniguruma matches them literally.
+          STREET_REGEX=$(yq '.streets[]' monitor-config.yml \
+            | sed 's/[].*+?(){}^$|\\[]/\\&/g' \
+            | tr '\n' '|' \
+            | sed 's/|$//')
+
+          # Build a jq boolean expression from price_caps, e.g.
+          # "(.bedrooms == 2 and .price <= 5500) or (.bedrooms == 3 and .price <= 6000)".
+          # Each key looks like "2br"; strip "br" to get the bedroom integer.
+          PRICE_FILTER=''
+          while IFS= read -r br_key; do
+            cap=$(yq ".price_caps.\"$br_key\"" monitor-config.yml)
+            br="${br_key%br}"
+            clause="(.bedrooms == $br and .price <= $cap)"
+            PRICE_FILTER="${PRICE_FILTER:+$PRICE_FILTER or }$clause"
+          done < <(yq '.price_caps | keys | .[]' monitor-config.yml)
+          [ -z "$PRICE_FILTER" ] && PRICE_FILTER='true'
+
+          # Append each value to the $GITHUB_OUTPUT file so downstream steps can read them.
+          # This is GitHub Actions' standard mechanism for passing data between steps.
+          {
+            echo "zip_code=$ZIP_CODE"
+            echo "bedrooms=$BEDROOMS"
+            echo "street_regex=$STREET_REGEX"
+            echo "price_filter=$PRICE_FILTER"
+          } >> "$GITHUB_OUTPUT"
+
+      # Decide which ZIP code to actually use: a manual dispatch input wins; if it is
+      # blank the config file's value is used instead via shell fallback syntax ${A:-B}.
+      # Both values are in env: (not inline ${{ }}) to prevent script injection.
+      - name: Resolve zip code
+        id: zip
+        env:
+          DISPATCH_ZIP: ${{ inputs.zip_code }}
+          ZIP_FROM_CONFIG: ${{ steps.config.outputs.zip_code }}
+        run: |
+          echo "zip_code=${DISPATCH_ZIP:-$ZIP_FROM_CONFIG}" >> "$GITHUB_OUTPUT"
+
+      # Create the two GitHub Issue labels used by this workflow if they do not already exist.
+      # --force makes the command succeed silently when a label is already present.
+      - name: Ensure labels exist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh label create "rental-digest" \
+            --color "0075ca" \
+            --description "Automated rental listing digest" \
+            --force
+          gh label create "monitor-failure" \
+            --color "d93f0b" \
+            --description "Rental monitor workflow failure" \
+            --force
+
+      # Call the Rentcast API and filter the results down to listings that match your
+      # streets and price caps; pass the filtered JSON and counts to later steps.
+      - name: Fetch and filter listings
+        id: listings
+        env:
+          RENTCAST_API_KEY: ${{ secrets.RENTCAST_API_KEY }}
+          ZIP_CODE: ${{ steps.zip.outputs.zip_code }}
+          BEDROOMS: ${{ steps.config.outputs.bedrooms }}
+          STREET_REGEX: ${{ steps.config.outputs.street_regex }}
+          PRICE_FILTER: ${{ steps.config.outputs.price_filter }}
+        run: |
+          # set -euo pipefail: abort on any error, treat unset variables as errors,
+          # and propagate failures through pipelines instead of silently swallowing them.
+          set -euo pipefail
+
+          # Call the Rentcast long-term rental listings endpoint; -w '%{http_code}' appends
+          # the HTTP status code to the output so we can check it separately from the body.
+          HTTP_STATUS=$(curl -sS -w '%{http_code}' -o /tmp/rentcast_response.json \
+            -H "X-Api-Key: $RENTCAST_API_KEY" \
+            "https://api.rentcast.io/v1/listings/rental/long-term?zipCode=${ZIP_CODE}&bedrooms=${BEDROOMS}&status=Active&limit=500")
+
+          # Abort if the API returned an error code (anything outside 200–299).
+          # cat prints the response body so the error message is visible in the run log.
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Rentcast API returned HTTP $HTTP_STATUS"
+            cat /tmp/rentcast_response.json || true
+            exit 1
+          fi
+
+          RESPONSE=$(cat /tmp/rentcast_response.json)
+
+          # Guard against an unexpected response shape such as an error object instead
+          # of the expected array; jq -e exits non-zero when the expression is false/null.
+          if ! echo "$RESPONSE" | jq -e 'type == "array"' > /dev/null; then
+            echo "Unexpected response format — expected JSON array"
+            echo "$RESPONSE" | head -c 500
+            exit 1
+          fi
+
+          TOTAL_COUNT=$(echo "$RESPONSE" | jq 'length')
+
+          # Keep only listings whose address contains one of your configured street names
+          # (case-insensitive) AND whose price is within your per-bedroom cap.
+          # PRICE_FILTER is machine-generated; setup.yml validates that all values are
+          # numeric, so interpolation into the jq expression is safe after setup passes.
+          FILTERED=$(echo "$RESPONSE" | jq \
+            --arg street_regex "$STREET_REGEX" \
+            '[.[] | select((.addressLine1 // "") | test($street_regex; "i")) | select(.price != null and ('"$PRICE_FILTER"'))]')
+
+          FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
+
+          # Write the two scalar counts using the simple KEY=VALUE format for step outputs.
+          echo "total_count=$TOTAL_COUNT"       >> "$GITHUB_OUTPUT"
+          echo "filtered_count=$FILTERED_COUNT" >> "$GITHUB_OUTPUT"
+
+          # Write the multi-line JSON array using a random delimiter to ensure no line
+          # inside the JSON is mistaken for the end marker.
+          # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+          DELIM=$(openssl rand -hex 8)
+          {
+            echo "filtered<<$DELIM"
+            echo "$FILTERED"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      # Upload the complete raw Rentcast response as a downloadable run artifact so you
+      # can inspect exactly what the API returned; it is never committed to the repository.
+      # See: https://docs.github.com/en/actions/using-workflows/storing-workflow-data-as-artifacts
+      - name: Save raw API response as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rentcast-raw-${{ github.run_id }}
+          path: /tmp/rentcast_response.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Compare the filtered listings against the persisted seen-listings.json to find
+      # listings that have never been reported before; emit their IDs and a count.
+      - name: Check for new listings
+        id: new
+        env:
+          FILTERED: ${{ steps.listings.outputs.filtered }}
+        run: |
+          set -euo pipefail
+
+          # Read the on-disk record of already-seen listing IDs, defaulting to an empty
+          # array if the file does not exist yet (e.g. on the very first run).
+          SEEN=$(cat data/seen-listings.json 2>/dev/null || echo '[]')
+          [ -z "$SEEN" ] && SEEN='[]'
+
+          # Pull just the IDs from each source; the seen list supports both the legacy
+          # plain-string format and the current {id, firstSeen} object format.
+          FILTERED_IDS=$(echo "$FILTERED" | jq '[.[] | select(.id) | .id]')
+          SEEN_IDS=$(echo "$SEEN" | jq '[.[] | if type == "object" then .id else . end | select(. != null)]')
+
+          # Keep only IDs that appear in the filtered results but not in the seen list.
+          NEW_IDS=$(jq -n \
+            --argjson filtered "$FILTERED_IDS" \
+            --argjson seen_ids "$SEEN_IDS" \
+            '[$filtered[] | select(. as $id | $seen_ids | index($id) | not)]')
+
+          NEW_COUNT=$(echo "$NEW_IDS" | jq 'length')
+
+          echo "new_count=$NEW_COUNT" >> "$GITHUB_OUTPUT"
+          # Random delimiter again because listing IDs are opaque strings that could
+          # contain anything.
+          DELIM=$(openssl rand -hex 8)
+          {
+            echo "new_ids<<$DELIM"
+            echo "$NEW_IDS"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      # Format a markdown issue body that lists every new find with its address, price,
+      # bedroom/bathroom counts, square footage, and a link to the listing when available.
+      - name: Build issue body
+        id: issue
+        if: steps.new.outputs.new_count > 0
+        env:
+          FILTERED: ${{ steps.listings.outputs.filtered }}
+          NEW_IDS: ${{ steps.new.outputs.new_ids }}
+        run: |
+          set -euo pipefail
+
+          TODAY=$(TZ=America/Los_Angeles date +"%B %d, %Y")
+
+          # jq -r produces raw string output (no surrounding quotes).
+          # Only listings whose ID appears in NEW_IDS are included; // is jq's
+          # "alternative" operator and returns the right-hand value when the left is null.
+          BODY=$(echo "$FILTERED" | jq -r \
+            --argjson new_ids "$NEW_IDS" \
+            --arg today "$TODAY" '
+            "## Rental Digest — " + $today + "\n\n" +
+            ([ .[]
+              | select(.id as $id | $new_ids | index($id) != null)
+              | "### " + (.addressLine1 // "Unknown address") + "\n"
+              + "- **Beds:** " + ((.bedrooms // "N/A") | tostring) + " | **Baths:** " + ((.bathrooms // "N/A") | tostring) + "\n"
+              + "- **Rent:** $" + ((.price // "N/A") | tostring) + "/mo\n"
+              + "- **Sq ft:** " + ((.squareFootage // "N/A") | tostring) + "\n"
+              + "- **First spotted:** " + $today + "\n"
+              + (if .listingUrl then "- **Listing:** " + .listingUrl + "\n" else "" end)
+            ] | join("\n\n---\n\n"))
+          ')
+
+          DELIM=$(openssl rand -hex 8)
+          {
+            echo "body<<$DELIM"
+            echo "$BODY"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      # Create a GitHub Issue in this repository containing the full rental digest.
+      # This step is skipped entirely when dry_run is true.
+      # See: https://docs.github.com/en/rest/issues/issues#create-an-issue
+      - name: Open GitHub Issue
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run != true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY: ${{ steps.issue.outputs.body }}
+          COUNT: ${{ steps.new.outputs.new_count }}
+        run: |
+          set -euo pipefail
+
+          TODAY=$(TZ=America/Los_Angeles date +"%B %d, %Y")
+
+          # Use curl to call the GitHub REST API directly; jq -n builds the request JSON
+          # safely without any shell escaping of the issue body content.
+          curl -sSf -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -d "$(jq -n \
+              --arg title "$COUNT new listing(s) — $TODAY" \
+              --arg body "$BODY" \
+              '{title: $title, body: $body, labels: ["rental-digest"]}')" \
+            || { code=$?; echo "Failed to create digest issue (curl exit $code)"; exit "$code"; }
+
+      # When dry_run is true, print the issue body that would have been posted so you can
+      # verify your filter and formatting without opening a real issue.
+      - name: Log dry-run matches
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run == true
+        env:
+          BODY: ${{ steps.issue.outputs.body }}
+          COUNT: ${{ steps.new.outputs.new_count }}
+        run: |
+          echo "=== DRY RUN: $COUNT new listing(s) would have been reported ==="
+          echo "$BODY"
+
+      # Record newly discovered listing IDs and today's date in seen-listings.json so they
+      # are not reported again on future runs. Skipped in dry_run mode.
+      - name: Update seen listings
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run != true
+        env:
+          NEW_IDS: ${{ steps.new.outputs.new_ids }}
+        run: |
+          set -euo pipefail
+
+          SEEN=$(cat data/seen-listings.json 2>/dev/null || echo '[]')
+          [ -z "$SEEN" ] && SEEN='[]'
+
+          TODAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
+
+          # Merge the existing seen list with the new IDs, migrating any legacy plain-string
+          # entries to the {id, firstSeen} object format, then deduplicate by ID.
+          UPDATED=$(jq -n \
+            --argjson seen "$SEEN" \
+            --argjson new_ids "$NEW_IDS" \
+            --arg today "$TODAY" \
+            '($seen | map(if type == "string" then {id: ., firstSeen: "unknown"} else . end)) +
+             ($new_ids | map({id: ., firstSeen: $today})) |
+             unique_by(.id)')
+
+          echo "$UPDATED" > data/seen-listings.json
+
+      # Write a small JSON file that records when this run happened and what it found.
+      # Runs on every execution — including failures — so silence can never be mistaken
+      # for a healthy but quiet monitor.
+      - name: Write heartbeat
+        if: always()
+        env:
+          TOTAL_COUNT: ${{ steps.listings.outputs.total_count }}
+          FILTERED_COUNT: ${{ steps.listings.outputs.filtered_count }}
+          NEW_COUNT: ${{ steps.new.outputs.new_count }}
+        run: |
+          set -euo pipefail
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Sanitize counts before passing to --argjson: a partial or failed prior step
+          # could leave a non-numeric value, which would cause jq to abort the heartbeat.
+          _total="${TOTAL_COUNT:-0}";     [[ "$_total"  =~ ^[0-9]+$ ]] || _total=0
+          _filter="${FILTERED_COUNT:-0}"; [[ "$_filter" =~ ^[0-9]+$ ]] || _filter=0
+          _new="${NEW_COUNT:-0}";         [[ "$_new"    =~ ^[0-9]+$ ]] || _new=0
+
+          # jq -n builds a JSON object from scratch (no stdin input).
+          jq -n \
+            --arg lastRun "$NOW" \
+            --argjson totalInZip "$_total" \
+            --argjson afterFilter "$_filter" \
+            --argjson newListings "$_new" \
+            '{lastRun: $lastRun, totalInZip: $totalInZip, afterFilter: $afterFilter, newListings: $newListings}' \
+            > data/last-run.json
+
+      # Commit seen-listings.json and last-run.json back to the repository if either changed.
+      # [skip ci] in the commit message tells GitHub Actions not to trigger this workflow
+      # again from the automated push, preventing an infinite loop.
+      - name: Commit data updates
+        if: always() && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+
+          # Configure the identity that will appear as the commit author.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/seen-listings.json data/last-run.json
+          # git diff --staged --quiet exits 0 when nothing changed; only commit when there
+          # is actually something new to record so the history stays clean.
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update monitor data [skip ci]"
+            # Rebase on any commits pushed to main since checkout (e.g. config tweaks) to
+            # prevent non-fast-forward rejections from out-of-band pushes during a run.
+            git pull --rebase origin main
+            git push
+          fi
+
+      # If any earlier step in this job failed, open a GitHub Issue so you know the monitor
+      # is broken rather than silently missing listings. Runs only when there is a failure.
+      - name: Notify on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Re-attempt label creation in case the "Ensure labels exist" step was the one
+          # that failed. --force is idempotent; || true prevents this from masking the
+          # original failure if GitHub is unreachable.
+          gh label create "monitor-failure" \
+            --color "d93f0b" \
+            --description "Rental monitor workflow failure" \
+            --force 2>/dev/null || true
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Build a direct URL to this specific run so the issue body is one click away
+          # from the full logs.
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -sSf -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -d "$(jq -n \
+              --arg title "Monitor workflow failed — $NOW" \
+              --arg body "The rental monitor workflow failed and may have stopped reporting new listings.\n\nRun: $RUN_URL" \
+              '{title: $title, body: $body, labels: ["monitor-failure"]}')" \
+            || echo "Failed to open failure-notification issue (curl exit $?)"

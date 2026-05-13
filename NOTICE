@@ -1,0 +1,35 @@
+# NOTICE
+
+## Rental Data
+
+Listing data retrieved by this tool is provided by the Rentcast API
+(https://rentcast.io). Use of the Rentcast API is subject to Rentcast's
+Terms of Service (https://rentcast.io/terms).
+
+### Personal use
+
+This tool is designed for **personal, non-commercial rental searching only**.
+It is not intended for data aggregation, redistribution, or any commercial
+purpose. The Rentcast free tier is explicitly for personal use — please review
+Rentcast's current Terms of Service before deploying.
+
+### Data stored
+
+`data/seen-listings.json` stores only listing IDs and first-seen dates — not
+full listing data (addresses, prices, or other PII). The raw API response is
+uploaded as a GitHub Actions artifact with a 7-day retention period and is
+never committed to the repository.
+
+GitHub Issues opened by the monitor contain full listing details (address,
+price, bedroom/bathroom counts, square footage, and listing URL). If the
+repository is public, this content is publicly visible. The README recommends
+keeping the repository private for this reason.
+
+All of the above choices are intentional to remain within the spirit of
+Rentcast's personal-use terms.
+
+### Attribution
+
+If you publish results or derivative works, consider adding "data from
+Rentcast" to your attribution. Check Rentcast's current Terms of Service for
+the latest requirements.

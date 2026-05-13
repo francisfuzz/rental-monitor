@@ -102,8 +102,10 @@ Expected output with the default fixture: **3 listings pass** (fixture-001/002/0
   YAML, use `yq`. If you need to process JSON, use `jq`.
 - **`inputs.dry_run`** is a boolean in the workflow YAML (`type: boolean`). Compare
   with `true`/`false` (unquoted), not `'true'`/`'false'` (strings).
-- **`inputs.zip_code`** must be passed via `env:` into shell steps — never inline
-  `${{ inputs.zip_code }}` inside a `run:` script (shell injection vector).
+- **No inline `${{ }}` in `run:` scripts** — pass all workflow expression values
+  through `env:` and reference them as `$VAR`. This applies to `inputs.*`,
+  `steps.*.outputs.*`, and any other expression whose value could be attacker-influenced.
+  Inline interpolation evaluates before bash runs, enabling code injection.
 - **`[skip ci]`** in the data-commit message prevents the automated push from
   triggering a new workflow run (infinite loop guard).
 - The failure-notification step re-creates the `monitor-failure` label with

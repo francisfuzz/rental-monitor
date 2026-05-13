@@ -51,9 +51,22 @@ jobs:
               ERRORS+=('Missing required field: `zip_code`')
             fi
 
+            # yq's type filter returns "array" for YAML sequences, "null" for missing fields,
+            # and "string"/"number" for non-list values that would silently pass a length check.
+            STREETS_TYPE=$(yq '.streets | type' monitor-config.yml)
             STREETS_COUNT=$(yq '.streets | length' monitor-config.yml)
-            if [ "$STREETS_COUNT" -eq 0 ]; then
+            if [ "$STREETS_TYPE" = "null" ]; then
               ERRORS+=('Missing required field: `streets`')
+            elif [ "$STREETS_TYPE" != "array" ] || [ "$STREETS_COUNT" -eq 0 ]; then
+              ERRORS+=('`streets` must be a non-empty list')
+            else
+              # An empty-string entry produces an empty regex that matches every address —
+              # every listing in the ZIP would pass the street filter.
+              while IFS= read -r street; do
+                if [ -z "$street" ]; then
+                  ERRORS+=('`streets` contains an empty entry — remove or replace it')
+                fi
+              done < <(yq '.streets[]' monitor-config.yml)
             fi
 
             # Each key must end in "br" and each value must be numeric; the monitor
@@ -65,7 +78,14 @@ jobs:
             else
               while IFS= read -r key; do
                 case "$key" in
-                  *br) ;;
+                  *br)
+                    # The prefix must be a non-negative integer; a key like "abr" strips to
+                    # "a", producing `.bedrooms == a` in jq which is a syntax error at runtime.
+                    prefix="${key%br}"
+                    if ! printf '%s' "$prefix" | grep -qE '^[0-9]+$'; then
+                      ERRORS+=("\`price_caps\` key \"$key\" must have a numeric prefix (e.g. 2br, 3br)")
+                    fi
+                    ;;
                   *) ERRORS+=("\`price_caps\` key \"$key\" must end in \"br\" (e.g. 2br, 3br)") ;;
                 esac
                 val=$(yq ".price_caps.\"$key\"" monitor-config.yml)

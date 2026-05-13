@@ -60,8 +60,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_CODE=$(yq '.zip_code' monitor-config.yml)
-          BEDROOMS=$(yq '.bedrooms // "2:3"' monitor-config.yml)
+          ZIP_CODE=$(yq '.zip_code // ""' monitor-config.yml)
+          if [ -z "$ZIP_CODE" ]; then
+            echo "ERROR: zip_code is missing in monitor-config.yml — run the Setup Validation workflow." >&2
+            exit 1
+          fi
+          BEDROOMS=$(yq '.bedrooms // ""' monitor-config.yml)
+          [ -z "$BEDROOMS" ] && BEDROOMS="2:3"
 
           # Escape only oniguruma metacharacters in each street name (e.g. the dot in
           # "St. James Pl."), then join with | as the alternation operator.
@@ -94,14 +99,14 @@ jobs:
 
       # Decide which ZIP code to actually use: a manual dispatch input wins; if it is
       # blank the config file's value is used instead via shell fallback syntax ${A:-B}.
-      # DISPATCH_ZIP is in env: (not inline ${{ }}) to prevent script injection via the input.
+      # Both values are in env: (not inline ${{ }}) to prevent script injection.
       - name: Resolve zip code
         id: zip
         env:
           DISPATCH_ZIP: ${{ inputs.zip_code }}
+          ZIP_FROM_CONFIG: ${{ steps.config.outputs.zip_code }}
         run: |
-          CONFIG_ZIP="${{ steps.config.outputs.zip_code }}"
-          echo "zip_code=${DISPATCH_ZIP:-$CONFIG_ZIP}" >> "$GITHUB_OUTPUT"
+          echo "zip_code=${DISPATCH_ZIP:-$ZIP_FROM_CONFIG}" >> "$GITHUB_OUTPUT"
 
       # Create the two GitHub Issue labels used by this workflow if they do not already exist.
       # --force makes the command succeed silently when a label is already present.
@@ -162,8 +167,8 @@ jobs:
 
           # Keep only listings whose address contains one of your configured street names
           # (case-insensitive) AND whose price is within your per-bedroom cap.
-          # PRICE_FILTER is machine-generated from monitor-config.yml, so it is safe to
-          # interpolate directly into the jq expression via shell string joining.
+          # PRICE_FILTER is machine-generated; setup.yml validates that all values are
+          # numeric, so interpolation into the jq expression is safe after setup passes.
           FILTERED=$(echo "$RESPONSE" | jq \
             --arg street_regex "$STREET_REGEX" \
             '[.[] | select((.addressLine1 // "") | test($street_regex; "i")) | select(.price != null and ('"$PRICE_FILTER"'))]')
@@ -348,14 +353,18 @@ jobs:
 
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+          # Sanitize counts before passing to --argjson: a partial or failed prior step
+          # could leave a non-numeric value, which would cause jq to abort the heartbeat.
+          _total="${TOTAL_COUNT:-0}";     [[ "$_total"  =~ ^[0-9]+$ ]] || _total=0
+          _filter="${FILTERED_COUNT:-0}"; [[ "$_filter" =~ ^[0-9]+$ ]] || _filter=0
+          _new="${NEW_COUNT:-0}";         [[ "$_new"    =~ ^[0-9]+$ ]] || _new=0
+
           # jq -n builds a JSON object from scratch (no stdin input).
-          # ${VAR:-0} falls back to 0 when a variable is empty, e.g. if the fetch step
-          # failed before it could set TOTAL_COUNT or FILTERED_COUNT.
           jq -n \
             --arg lastRun "$NOW" \
-            --argjson totalInZip "${TOTAL_COUNT:-0}" \
-            --argjson afterFilter "${FILTERED_COUNT:-0}" \
-            --argjson newListings "${NEW_COUNT:-0}" \
+            --argjson totalInZip "$_total" \
+            --argjson afterFilter "$_filter" \
+            --argjson newListings "$_new" \
             '{lastRun: $lastRun, totalInZip: $totalInZip, afterFilter: $afterFilter, newListings: $newListings}' \
             > data/last-run.json
 
@@ -375,6 +384,9 @@ jobs:
           # is actually something new to record so the history stays clean.
           if ! git diff --staged --quiet; then
             git commit -m "chore: update monitor data [skip ci]"
+            # Rebase on any commits pushed to main since checkout (e.g. config tweaks) to
+            # prevent non-fast-forward rejections from out-of-band pushes during a run.
+            git pull --rebase origin main
             git push
           fi
 
@@ -407,4 +419,5 @@ jobs:
             -d "$(jq -n \
               --arg title "Monitor workflow failed — $NOW" \
               --arg body "The rental monitor workflow failed and may have stopped reporting new listings.\n\nRun: $RUN_URL" \
-              '{title: $title, body: $body, labels: ["monitor-failure"]}')"
+              '{title: $title, body: $body, labels: ["monitor-failure"]}')" \
+            || echo "Failed to open failure-notification issue (curl exit $?)"

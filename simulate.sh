@@ -119,7 +119,7 @@ header "Build issue body"
 if [ "$NEW_COUNT" -eq 0 ]; then
     echo "  (no new listings — issue body step would be skipped)"
 else
-    TODAY=$(date +"%B %d, %Y")
+    TODAY=$(TZ=America/Los_Angeles date +"%B %d, %Y")
 
     BODY=$(echo "$FILTERED" | jq -r \
         --argjson new_ids "$NEW_IDS" \

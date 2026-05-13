@@ -1,5 +1,7 @@
 # rental-monitor
 
+![rental-monitor hero](docs/hero.png)
+
 A GitHub Actions template that watches rental listings in your target
 neighborhood and opens a GitHub Issue whenever new listings appear. Powered
 by the [Rentcast API](https://rentcast.io). No code changes required — just

@@ -59,7 +59,7 @@ jobs:
         id: config
         run: |
           python3 - <<'PYEOF'
-          import yaml, os
+          import yaml, os, re
 
           # Load the YAML config file from the root of the repository.
           with open('monitor-config.yml') as f:
@@ -70,9 +70,9 @@ jobs:
           price_caps = cfg.get('price_caps', {})
           bedrooms   = str(cfg.get('bedrooms', '2:3'))
 
-          # Join the list of street names into a single regex pattern like
-          # "Main St|Oak Ave|Pine Rd" for case-insensitive substring matching later.
-          street_regex = '|'.join(str(s) for s in streets)
+          # Escape each street name before joining so regex metacharacters in names
+          # like "St. James Pl." are treated as literals, not regex operators.
+          street_regex = '|'.join(re.escape(str(s)) for s in streets)
 
           # Build a jq boolean expression from price_caps, e.g.
           # "(.bedrooms == 2 and .price <= 5500) or (.bedrooms == 3 and .price <= 6000)".
@@ -93,10 +93,12 @@ jobs:
 
       # Decide which ZIP code to actually use: a manual dispatch input wins; if it is
       # blank the config file's value is used instead via shell fallback syntax ${A:-B}.
+      # DISPATCH_ZIP is in env: (not inline ${{ }}) to prevent script injection via the input.
       - name: Resolve zip code
         id: zip
+        env:
+          DISPATCH_ZIP: ${{ inputs.zip_code }}
         run: |
-          DISPATCH_ZIP="${{ inputs.zip_code }}"
           CONFIG_ZIP="${{ steps.config.outputs.zip_code }}"
           echo "zip_code=${DISPATCH_ZIP:-$CONFIG_ZIP}" >> "$GITHUB_OUTPUT"
 
@@ -272,7 +274,7 @@ jobs:
       # This step is skipped entirely when dry_run is true.
       # See: https://docs.github.com/en/rest/issues/issues#create-an-issue
       - name: Open GitHub Issue
-        if: steps.new.outputs.new_count > 0 && inputs.dry_run != 'true'
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run != true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BODY: ${{ steps.issue.outputs.body }}
@@ -297,7 +299,7 @@ jobs:
       # When dry_run is true, print the issue body that would have been posted so you can
       # verify your filter and formatting without opening a real issue.
       - name: Log dry-run matches
-        if: steps.new.outputs.new_count > 0 && inputs.dry_run == 'true'
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run == true
         env:
           BODY: ${{ steps.issue.outputs.body }}
           COUNT: ${{ steps.new.outputs.new_count }}
@@ -308,7 +310,7 @@ jobs:
       # Record newly discovered listing IDs and today's date in seen-listings.json so they
       # are not reported again on future runs. Skipped in dry_run mode.
       - name: Update seen listings
-        if: steps.new.outputs.new_count > 0 && inputs.dry_run != 'true'
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run != true
         env:
           NEW_IDS: ${{ steps.new.outputs.new_ids }}
         run: |
@@ -360,7 +362,7 @@ jobs:
       # [skip ci] in the commit message tells GitHub Actions not to trigger this workflow
       # again from the automated push, preventing an infinite loop.
       - name: Commit data updates
-        if: always() && inputs.dry_run != 'true'
+        if: always() && inputs.dry_run != true
         run: |
           set -euo pipefail
 
@@ -383,6 +385,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # Re-attempt label creation in case the "Ensure labels exist" step was the one
+          # that failed. --force is idempotent; || true prevents this from masking the
+          # original failure if GitHub is unreachable.
+          gh label create "monitor-failure" \
+            --color "d93f0b" \
+            --description "Rental monitor workflow failure" \
+            --force 2>/dev/null || true
 
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           # Build a direct URL to this specific run so the issue body is one click away

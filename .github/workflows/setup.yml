@@ -36,7 +36,7 @@ jobs:
         id: validate_config
         run: |
           python3 - <<'PYEOF'
-          import yaml, os, sys
+          import yaml, os, sys, secrets
 
           errors = []
 
@@ -63,22 +63,27 @@ jobs:
           if not cfg.get('price_caps'):
               errors.append('Missing required field: `price_caps`')
           else:
-              # Each price_caps key must end in "br" (e.g. 2br) because the monitor
-              # workflow strips that suffix to derive the bedroom count as an integer.
-              for key in cfg['price_caps']:
+              # Each key must end in "br" and each value must be numeric; the monitor
+              # workflow interpolates values directly into a jq expression, so a
+              # non-numeric value produces a jq syntax error at runtime.
+              for key, val in cfg['price_caps'].items():
                   if not str(key).endswith('br'):
                       errors.append(f'`price_caps` key "{key}" must end in "br" (e.g. 2br, 3br)')
+                  try:
+                      float(str(val))
+                  except (ValueError, TypeError):
+                      errors.append(f'`price_caps` value for "{key}" must be a number, got {val!r}')
 
           if not cfg.get('bedrooms'):
               errors.append('Missing required field: `bedrooms`')
 
-          # Write has_errors (true/false) and the error list to $GITHUB_OUTPUT; the
-          # errors value uses a heredoc-style delimiter because it spans multiple lines.
+          # Write has_errors (true/false) and the error list to $GITHUB_OUTPUT; a random
+          # delimiter prevents any error message text from accidentally closing the block.
           out_file = os.environ.get('GITHUB_OUTPUT', '/dev/stdout')
           with open(out_file, 'a') as fh:
               fh.write(f'has_errors={"true" if errors else "false"}\n')
               if errors:
-                  delim = 'CONFIG_ERRORS_DELIM'
+                  delim = secrets.token_hex(8)
                   fh.write(f'errors<<{delim}\n')
                   for e in errors:
                       fh.write(f'- {e}\n')

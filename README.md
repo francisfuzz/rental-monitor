@@ -65,8 +65,14 @@ bedrooms: "2:3"            # Bedroom range for the API query
 
 ### 5. Push
 
-Commit and push your changes. The **Setup Validation** workflow runs
-automatically on push and will open a GitHub Issue if anything is missing.
+Commit and push your `monitor-config.yml` changes. The **Setup Validation**
+workflow triggers automatically whenever `monitor-config.yml` is pushed to
+`main` and will open a GitHub Issue if anything is missing.
+
+> **Using the default config?** If you are happy with the Newport Coast sample
+> values and have not edited `monitor-config.yml`, the path-filtered trigger
+> will not fire. In that case, go to **Actions → Setup Validation → Run
+> workflow** and trigger it manually to confirm your secret is in place.
 
 Once setup passes, wait for the next scheduled run (8 AM Pacific by default)
 or trigger the **Rental Monitor** workflow manually from the **Actions** tab.

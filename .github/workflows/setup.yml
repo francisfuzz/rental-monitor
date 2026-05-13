@@ -1,22 +1,37 @@
+# This workflow validates your monitor-config.yml and checks that the required API key
+# secret is set; it opens a GitHub Issue with a fix checklist when either check fails.
 name: Setup Validation
 
 on:
+  # Trigger automatically whenever monitor-config.yml is pushed to main so config
+  # mistakes are caught immediately on the first meaningful commit.
   push:
     branches: [main]
     paths:
       - 'monitor-config.yml'
+  # Also allow a manual run from the Actions tab to re-validate after fixing a problem.
+  # See: https://docs.github.com/en/actions/using-workflows/manually-running-a-workflow
   workflow_dispatch:
 
 jobs:
   validate:
+    # Spin up a fresh GitHub-hosted Ubuntu virtual machine for this job.
     runs-on: ubuntu-latest
+    # Only needs permission to open issues — no file writes are required.
+    # See: https://docs.github.com/en/actions/security-guides/automatic-token-authentication
     permissions:
       issues: write
 
     steps:
+      # Copy the repository files onto the runner so the validation script can read
+      # monitor-config.yml.
+      # See: https://github.com/actions/checkout
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Parse monitor-config.yml with Python and verify that all four required fields
+      # are present and correctly formatted; results are written to $GITHUB_OUTPUT.
+      # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-output-parameter
       - name: Validate monitor-config.yml
         id: validate_config
         run: |
@@ -25,6 +40,8 @@ jobs:
 
           errors = []
 
+          # Attempt to load the config file; a YAML syntax error is itself reported as
+          # a validation failure so it shows up in the checklist issue.
           try:
               with open('monitor-config.yml') as f:
                   cfg = yaml.safe_load(f)
@@ -32,6 +49,8 @@ jobs:
               errors.append(f'Could not parse monitor-config.yml: {e}')
               cfg = {}
 
+          # Check each required field individually so the checklist names every problem
+          # at once rather than stopping at the first missing field.
           if not cfg.get('zip_code'):
               errors.append('Missing required field: `zip_code`')
 
@@ -44,6 +63,8 @@ jobs:
           if not cfg.get('price_caps'):
               errors.append('Missing required field: `price_caps`')
           else:
+              # Each price_caps key must end in "br" (e.g. 2br) because the monitor
+              # workflow strips that suffix to derive the bedroom count as an integer.
               for key in cfg['price_caps']:
                   if not str(key).endswith('br'):
                       errors.append(f'`price_caps` key "{key}" must end in "br" (e.g. 2br, 3br)')
@@ -51,6 +72,8 @@ jobs:
           if not cfg.get('bedrooms'):
               errors.append('Missing required field: `bedrooms`')
 
+          # Write has_errors (true/false) and the error list to $GITHUB_OUTPUT; the
+          # errors value uses a heredoc-style delimiter because it spans multiple lines.
           out_file = os.environ.get('GITHUB_OUTPUT', '/dev/stdout')
           with open(out_file, 'a') as fh:
               fh.write(f'has_errors={"true" if errors else "false"}\n')
@@ -61,6 +84,9 @@ jobs:
                       fh.write(f'- {e}\n')
                   fh.write(f'{delim}\n')
 
+          # Emit ::error:: annotations so each problem is highlighted inline in the
+          # Actions run log without requiring you to dig into the full output.
+          # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message
           for e in errors:
               print(f'::error::{e}', file=sys.stderr)
 
@@ -68,6 +94,9 @@ jobs:
               print('Config validation passed.')
           PYEOF
 
+      # Check whether the RENTCAST_API_KEY secret has been added to the repository by
+      # mapping it to an environment variable — GitHub resolves a missing secret to an
+      # empty string, so an empty variable means the secret is not set.
       - name: Check API key
         id: check_key
         env:
@@ -75,12 +104,16 @@ jobs:
         run: |
           if [ -z "$RENTCAST_API_KEY" ]; then
             echo "api_key_missing=true" >> "$GITHUB_OUTPUT"
+            # ::warning:: prints a yellow banner in the run log without failing the job,
+            # so the issue-opening step below still runs.
             echo "::warning::RENTCAST_API_KEY secret is not set"
           else
             echo "api_key_missing=false" >> "$GITHUB_OUTPUT"
             echo "RENTCAST_API_KEY secret is set."
           fi
 
+      # Create the "setup" issue label if it does not already exist — only when there is
+      # actually something wrong, so clean setups never have a stray label created.
       - name: Ensure setup label exists
         if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
         env:
@@ -91,6 +124,9 @@ jobs:
             --description "Setup required" \
             --force
 
+      # Open a GitHub Issue with a step-by-step checklist for every problem found above.
+      # The body is built in Python to avoid shell quoting and newline pitfalls that arise
+      # when constructing multi-section markdown as a CLI argument.
       - name: Open setup checklist issue
         if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
         env:
@@ -106,6 +142,8 @@ jobs:
           api_key_missing = os.environ.get('API_KEY_MISSING') == 'true'
           config_errors   = os.environ.get('CONFIG_ERRORS', '').strip()
 
+          # Build the issue body as a list of lines, adding a section for each
+          # problem that was found.
           lines = [
               '## Setup Required',
               '',
@@ -113,6 +151,8 @@ jobs:
               '',
           ]
 
+          # Add numbered steps for obtaining and storing the Rentcast API key only when
+          # it is actually missing, so users do not see irrelevant instructions.
           if api_key_missing:
               lines += [
                   '### Missing API Key',
@@ -124,6 +164,8 @@ jobs:
                   '',
               ]
 
+          # Include the exact validation error messages from the previous step so users
+          # know precisely which fields to fix in monitor-config.yml.
           if config_errors:
               lines += [
                   '### Config Errors in `monitor-config.yml`',
@@ -142,6 +184,8 @@ jobs:
 
           body = '\n'.join(lines)
           body_file = '/tmp/setup_issue_body.md'
+          # Write the body to a temp file and pass it with --body-file to avoid any
+          # length limits or encoding issues when passing markdown as a CLI argument.
           with open(body_file, 'w') as f:
               f.write(body)
 
@@ -153,6 +197,8 @@ jobs:
           ], check=True)
           PYEOF
 
+      # Print a confirmation message when every check passes so the run log clearly shows
+      # the monitor is fully configured and ready for its first scheduled run.
       - name: Validation passed
         if: steps.validate_config.outputs.has_errors == 'false' && steps.check_key.outputs.api_key_missing == 'false'
         run: |

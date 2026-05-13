@@ -1,0 +1,304 @@
+name: Rental Monitor
+
+on:
+  schedule:
+    # Default: 8 AM Pacific (UTC-7 PDT / UTC-8 PST). Adjust to your timezone.
+    # https://crontab.guru/ can help generate cron expressions.
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+    inputs:
+      zip_code:
+        description: 'Override zip code from monitor-config.yml (optional)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Log matches without opening issues or updating seen-listings.json'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: rental-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Parse config
+        id: config
+        run: |
+          python3 - <<'PYEOF'
+          import yaml, os
+
+          with open('monitor-config.yml') as f:
+              cfg = yaml.safe_load(f)
+
+          zip_code  = str(cfg['zip_code'])
+          streets   = cfg.get('streets', [])
+          price_caps = cfg.get('price_caps', {})
+          bedrooms  = str(cfg.get('bedrooms', '2:3'))
+
+          street_regex = '|'.join(str(s) for s in streets)
+
+          clauses = []
+          for k, v in price_caps.items():
+              br = int(str(k).replace('br', ''))
+              clauses.append(f'(.bedrooms == {br} and .price <= {v})')
+          price_filter = ' or '.join(clauses) if clauses else 'true'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f'zip_code={zip_code}\n')
+              fh.write(f'bedrooms={bedrooms}\n')
+              fh.write(f'street_regex={street_regex}\n')
+              fh.write(f'price_filter={price_filter}\n')
+          PYEOF
+
+      - name: Resolve zip code
+        id: zip
+        run: |
+          DISPATCH_ZIP="${{ inputs.zip_code }}"
+          CONFIG_ZIP="${{ steps.config.outputs.zip_code }}"
+          echo "zip_code=${DISPATCH_ZIP:-$CONFIG_ZIP}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure labels exist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh label create "rental-digest" \
+            --color "0075ca" \
+            --description "Automated rental listing digest" \
+            --force
+          gh label create "monitor-failure" \
+            --color "d93f0b" \
+            --description "Rental monitor workflow failure" \
+            --force
+
+      - name: Fetch and filter listings
+        id: listings
+        env:
+          RENTCAST_API_KEY: ${{ secrets.RENTCAST_API_KEY }}
+          ZIP_CODE: ${{ steps.zip.outputs.zip_code }}
+          BEDROOMS: ${{ steps.config.outputs.bedrooms }}
+          STREET_REGEX: ${{ steps.config.outputs.street_regex }}
+          PRICE_FILTER: ${{ steps.config.outputs.price_filter }}
+        run: |
+          set -euo pipefail
+
+          HTTP_STATUS=$(curl -sS -w '%{http_code}' -o /tmp/rentcast_response.json \
+            -H "X-Api-Key: $RENTCAST_API_KEY" \
+            "https://api.rentcast.io/v1/listings/rental/long-term?zipCode=${ZIP_CODE}&bedrooms=${BEDROOMS}&status=Active&limit=500")
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "Rentcast API returned HTTP $HTTP_STATUS"
+            cat /tmp/rentcast_response.json || true
+            exit 1
+          fi
+
+          RESPONSE=$(cat /tmp/rentcast_response.json)
+
+          if ! echo "$RESPONSE" | jq -e 'type == "array"' > /dev/null; then
+            echo "Unexpected response format — expected JSON array"
+            echo "$RESPONSE" | head -c 500
+            exit 1
+          fi
+
+          TOTAL_COUNT=$(echo "$RESPONSE" | jq 'length')
+
+          # PRICE_FILTER is machine-generated from monitor-config.yml; safe to interpolate.
+          FILTERED=$(echo "$RESPONSE" | jq \
+            --arg street_regex "$STREET_REGEX" \
+            '[.[] | select((.addressLine1 // "") | test($street_regex; "i")) | select(.price != null and ('"$PRICE_FILTER"'))]')
+
+          FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
+
+          echo "total_count=$TOTAL_COUNT"   >> "$GITHUB_OUTPUT"
+          echo "filtered_count=$FILTERED_COUNT" >> "$GITHUB_OUTPUT"
+
+          DELIM=$(openssl rand -hex 8)
+          {
+            echo "filtered<<$DELIM"
+            echo "$FILTERED"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Save raw API response as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rentcast-raw-${{ github.run_id }}
+          path: /tmp/rentcast_response.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Check for new listings
+        id: new
+        env:
+          FILTERED: ${{ steps.listings.outputs.filtered }}
+        run: |
+          set -euo pipefail
+
+          SEEN=$(cat data/seen-listings.json 2>/dev/null || echo '[]')
+          [ -z "$SEEN" ] && SEEN='[]'
+
+          FILTERED_IDS=$(echo "$FILTERED" | jq '[.[] | select(.id) | .id]')
+          SEEN_IDS=$(echo "$SEEN" | jq '[.[] | if type == "object" then .id else . end | select(. != null)]')
+
+          NEW_IDS=$(jq -n \
+            --argjson filtered "$FILTERED_IDS" \
+            --argjson seen_ids "$SEEN_IDS" \
+            '[$filtered[] | select(. as $id | $seen_ids | index($id) | not)]')
+
+          NEW_COUNT=$(echo "$NEW_IDS" | jq 'length')
+
+          echo "new_count=$NEW_COUNT" >> "$GITHUB_OUTPUT"
+          DELIM=$(openssl rand -hex 8)
+          {
+            echo "new_ids<<$DELIM"
+            echo "$NEW_IDS"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build issue body
+        id: issue
+        if: steps.new.outputs.new_count > 0
+        env:
+          FILTERED: ${{ steps.listings.outputs.filtered }}
+          NEW_IDS: ${{ steps.new.outputs.new_ids }}
+        run: |
+          set -euo pipefail
+
+          TODAY=$(TZ=America/Los_Angeles date +"%B %d, %Y")
+
+          BODY=$(echo "$FILTERED" | jq -r \
+            --argjson new_ids "$NEW_IDS" \
+            --arg today "$TODAY" '
+            "## Rental Digest — " + $today + "\n\n" +
+            ([ .[]
+              | select(.id as $id | $new_ids | index($id) != null)
+              | "### " + (.addressLine1 // "Unknown address") + "\n"
+              + "- **Beds:** " + ((.bedrooms // "N/A") | tostring) + " | **Baths:** " + ((.bathrooms // "N/A") | tostring) + "\n"
+              + "- **Rent:** $" + ((.price // "N/A") | tostring) + "/mo\n"
+              + "- **Sq ft:** " + ((.squareFootage // "N/A") | tostring) + "\n"
+              + "- **First spotted:** " + $today + "\n"
+              + (if .listingUrl then "- **Listing:** " + .listingUrl + "\n" else "" end)
+            ] | join("\n\n---\n\n"))
+          ')
+
+          DELIM=$(openssl rand -hex 8)
+          {
+            echo "body<<$DELIM"
+            echo "$BODY"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open GitHub Issue
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY: ${{ steps.issue.outputs.body }}
+          COUNT: ${{ steps.new.outputs.new_count }}
+        run: |
+          set -euo pipefail
+
+          TODAY=$(TZ=America/Los_Angeles date +"%B %d, %Y")
+
+          curl -sSf -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -d "$(jq -n \
+              --arg title "$COUNT new listing(s) — $TODAY" \
+              --arg body "$BODY" \
+              '{title: $title, body: $body, labels: ["rental-digest"]}')" \
+            || { code=$?; echo "Failed to create digest issue (curl exit $code)"; exit "$code"; }
+
+      - name: Log dry-run matches
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run == 'true'
+        env:
+          BODY: ${{ steps.issue.outputs.body }}
+          COUNT: ${{ steps.new.outputs.new_count }}
+        run: |
+          echo "=== DRY RUN: $COUNT new listing(s) would have been reported ==="
+          echo "$BODY"
+
+      - name: Update seen listings
+        if: steps.new.outputs.new_count > 0 && inputs.dry_run != 'true'
+        env:
+          NEW_IDS: ${{ steps.new.outputs.new_ids }}
+        run: |
+          set -euo pipefail
+
+          SEEN=$(cat data/seen-listings.json 2>/dev/null || echo '[]')
+          [ -z "$SEEN" ] && SEEN='[]'
+
+          TODAY=$(TZ=America/Los_Angeles date +%Y-%m-%d)
+
+          UPDATED=$(jq -n \
+            --argjson seen "$SEEN" \
+            --argjson new_ids "$NEW_IDS" \
+            --arg today "$TODAY" \
+            '($seen | map(if type == "string" then {id: ., firstSeen: "unknown"} else . end)) +
+             ($new_ids | map({id: ., firstSeen: $today})) |
+             unique_by(.id)')
+
+          echo "$UPDATED" > data/seen-listings.json
+
+      - name: Write heartbeat
+        if: always()
+        env:
+          TOTAL_COUNT: ${{ steps.listings.outputs.total_count }}
+          FILTERED_COUNT: ${{ steps.listings.outputs.filtered_count }}
+          NEW_COUNT: ${{ steps.new.outputs.new_count }}
+        run: |
+          set -euo pipefail
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq -n \
+            --arg lastRun "$NOW" \
+            --argjson totalInZip "${TOTAL_COUNT:-0}" \
+            --argjson afterFilter "${FILTERED_COUNT:-0}" \
+            --argjson newListings "${NEW_COUNT:-0}" \
+            '{lastRun: $lastRun, totalInZip: $totalInZip, afterFilter: $afterFilter, newListings: $newListings}' \
+            > data/last-run.json
+
+      - name: Commit data updates
+        if: always() && inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/seen-listings.json data/last-run.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update monitor data [skip ci]"
+            git push
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -sSf -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues" \
+            -d "$(jq -n \
+              --arg title "Monitor workflow failed — $NOW" \
+              --arg body "The rental monitor workflow failed and may have stopped reporting new listings.\n\nRun: $RUN_URL" \
+              '{title: $title, body: $body, labels: ["monitor-failure"]}')"

@@ -29,75 +29,77 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # Parse monitor-config.yml with Python and verify that all four required fields
+      # Parse monitor-config.yml with yq and verify that all four required fields
       # are present and correctly formatted; results are written to $GITHUB_OUTPUT.
       # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-output-parameter
       - name: Validate monitor-config.yml
         id: validate_config
         run: |
-          python3 - <<'PYEOF'
-          import yaml, os, sys, secrets
+          set -euo pipefail
 
-          errors = []
+          ERRORS=()
 
-          # Attempt to load the config file; a YAML syntax error is itself reported as
-          # a validation failure so it shows up in the checklist issue.
-          try:
-              with open('monitor-config.yml') as f:
-                  cfg = yaml.safe_load(f)
-          except Exception as e:
-              errors.append(f'Could not parse monitor-config.yml: {e}')
-              cfg = {}
+          # yq exits non-zero on YAML syntax errors; redirect stderr to suppress noise here.
+          # A parse failure is itself added to ERRORS so it shows up in the checklist issue.
+          if ! yq '.' monitor-config.yml > /dev/null 2>&1; then
+            ERRORS+=('Could not parse monitor-config.yml: invalid YAML syntax')
+          else
 
-          # Check each required field individually so the checklist names every problem
-          # at once rather than stopping at the first missing field.
-          if not cfg.get('zip_code'):
-              errors.append('Missing required field: `zip_code`')
+            # Check each required field individually so the issue names every problem at once.
+            ZIP_CODE=$(yq '.zip_code // ""' monitor-config.yml)
+            if [ -z "$ZIP_CODE" ]; then
+              ERRORS+=('Missing required field: `zip_code`')
+            fi
 
-          streets = cfg.get('streets')
-          if not streets:
-              errors.append('Missing required field: `streets`')
-          elif not isinstance(streets, list) or len(streets) == 0:
-              errors.append('`streets` must be a non-empty list')
+            STREETS_COUNT=$(yq '.streets | length' monitor-config.yml)
+            if [ "$STREETS_COUNT" -eq 0 ]; then
+              ERRORS+=('Missing required field: `streets`')
+            fi
 
-          if not cfg.get('price_caps'):
-              errors.append('Missing required field: `price_caps`')
-          else:
-              # Each key must end in "br" and each value must be numeric; the monitor
-              # workflow interpolates values directly into a jq expression, so a
-              # non-numeric value produces a jq syntax error at runtime.
-              for key, val in cfg['price_caps'].items():
-                  if not str(key).endswith('br'):
-                      errors.append(f'`price_caps` key "{key}" must end in "br" (e.g. 2br, 3br)')
-                  try:
-                      float(str(val))
-                  except (ValueError, TypeError):
-                      errors.append(f'`price_caps` value for "{key}" must be a number, got {val!r}')
+            # Each key must end in "br" and each value must be numeric; the monitor
+            # workflow interpolates values directly into a jq expression, so a
+            # non-numeric value produces a jq syntax error at runtime.
+            PRICE_CAPS_COUNT=$(yq '.price_caps | length' monitor-config.yml)
+            if [ "$PRICE_CAPS_COUNT" -eq 0 ]; then
+              ERRORS+=('Missing required field: `price_caps`')
+            else
+              while IFS= read -r key; do
+                case "$key" in
+                  *br) ;;
+                  *) ERRORS+=("\`price_caps\` key \"$key\" must end in \"br\" (e.g. 2br, 3br)") ;;
+                esac
+                val=$(yq ".price_caps.\"$key\"" monitor-config.yml)
+                if ! printf '%s' "$val" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+                  ERRORS+=("\`price_caps\` value for \"$key\" must be a number, got $val")
+                fi
+              done < <(yq '.price_caps | keys | .[]' monitor-config.yml)
+            fi
 
-          if not cfg.get('bedrooms'):
-              errors.append('Missing required field: `bedrooms`')
+            BEDROOMS_VAL=$(yq '.bedrooms // ""' monitor-config.yml)
+            if [ -z "$BEDROOMS_VAL" ]; then
+              ERRORS+=('Missing required field: `bedrooms`')
+            fi
+
+          fi
 
           # Write has_errors (true/false) and the error list to $GITHUB_OUTPUT; a random
           # delimiter prevents any error message text from accidentally closing the block.
-          out_file = os.environ.get('GITHUB_OUTPUT', '/dev/stdout')
-          with open(out_file, 'a') as fh:
-              fh.write(f'has_errors={"true" if errors else "false"}\n')
-              if errors:
-                  delim = secrets.token_hex(8)
-                  fh.write(f'errors<<{delim}\n')
-                  for e in errors:
-                      fh.write(f'- {e}\n')
-                  fh.write(f'{delim}\n')
-
-          # Emit ::error:: annotations so each problem is highlighted inline in the
-          # Actions run log without requiring you to dig into the full output.
-          # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message
-          for e in errors:
-              print(f'::error::{e}', file=sys.stderr)
-
-          if not errors:
-              print('Config validation passed.')
-          PYEOF
+          # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#multiline-strings
+          if [ "${#ERRORS[@]}" -eq 0 ]; then
+            echo "has_errors=false" >> "$GITHUB_OUTPUT"
+            echo 'Config validation passed.'
+          else
+            echo "has_errors=true" >> "$GITHUB_OUTPUT"
+            DELIM=$(openssl rand -hex 8)
+            {
+              echo "errors<<$DELIM"
+              for e in "${ERRORS[@]}"; do printf '- %s\n' "$e"; done
+              echo "$DELIM"
+            } >> "$GITHUB_OUTPUT"
+            # Emit ::error:: annotations so each problem is highlighted inline in the run log.
+            # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message
+            for e in "${ERRORS[@]}"; do printf '::error::%s\n' "$e" >&2; done
+          fi
 
       # Check whether the RENTCAST_API_KEY secret has been added to the repository by
       # mapping it to an environment variable — GitHub resolves a missing secret to an
@@ -130,8 +132,8 @@ jobs:
             --force
 
       # Open a GitHub Issue with a step-by-step checklist for every problem found above.
-      # The body is built in Python to avoid shell quoting and newline pitfalls that arise
-      # when constructing multi-section markdown as a CLI argument.
+      # The body is written to a temp file and passed with --body-file to avoid CLI length
+      # limits and shell-quoting issues with multi-line markdown content.
       - name: Open setup checklist issue
         if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
         env:
@@ -141,66 +143,39 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - <<'PYEOF'
-          import os, subprocess
+          BODY_FILE=$(mktemp /tmp/setup_issue_body.XXXXXX.md)
+          trap 'rm -f "$BODY_FILE"' EXIT
 
-          api_key_missing = os.environ.get('API_KEY_MISSING') == 'true'
-          config_errors   = os.environ.get('CONFIG_ERRORS', '').strip()
+          # Build the issue body, adding a section only for each problem that was found.
+          # printf is used instead of echo to avoid platform differences with \n handling.
+          {
+            printf '## Setup Required\n\n'
+            printf 'Your rental monitor needs attention before it can run.\n\n'
 
-          # Build the issue body as a list of lines, adding a section for each
-          # problem that was found.
-          lines = [
-              '## Setup Required',
-              '',
-              'Your rental monitor needs attention before it can run.',
-              '',
-          ]
+            # Add API key instructions only when the secret is actually missing.
+            if [ "$API_KEY_MISSING" = "true" ]; then
+              printf '### Missing API Key\n\n'
+              printf '- [ ] Add your Rentcast API key as a repository secret named `RENTCAST_API_KEY`\n'
+              printf '  1. Go to **Settings → Secrets and variables → Actions → New repository secret**\n'
+              printf '  2. Name: `RENTCAST_API_KEY`\n'
+              printf '  3. Value: your key from [app.rentcast.io](https://app.rentcast.io/app/api)\n\n'
+            fi
 
-          # Add numbered steps for obtaining and storing the Rentcast API key only when
-          # it is actually missing, so users do not see irrelevant instructions.
-          if api_key_missing:
-              lines += [
-                  '### Missing API Key',
-                  '',
-                  '- [ ] Add your Rentcast API key as a repository secret named `RENTCAST_API_KEY`',
-                  '  1. Go to **Settings → Secrets and variables → Actions → New repository secret**',
-                  '  2. Name: `RENTCAST_API_KEY`',
-                  '  3. Value: your key from [app.rentcast.io](https://app.rentcast.io/app/api)',
-                  '',
-              ]
+            # Include the exact validation errors so users know precisely what to fix.
+            if [ -n "$CONFIG_ERRORS" ]; then
+              printf '### Config Errors in `monitor-config.yml`\n\n'
+              printf '%s\n\n' "$CONFIG_ERRORS"
+              printf 'Edit `monitor-config.yml` to fix these issues, then push.\n\n'
+            fi
 
-          # Include the exact validation error messages from the previous step so users
-          # know precisely which fields to fix in monitor-config.yml.
-          if config_errors:
-              lines += [
-                  '### Config Errors in `monitor-config.yml`',
-                  '',
-                  config_errors,
-                  '',
-                  'Edit `monitor-config.yml` to fix these issues, then push.',
-                  '',
-              ]
+            printf '---\n'
+            printf 'Once all items are resolved, push a change to `monitor-config.yml` or re-run this workflow to validate again.\n'
+          } > "$BODY_FILE"
 
-          lines += [
-              '---',
-              'Once all items are resolved, push a change to `monitor-config.yml` '
-              'or re-run this workflow to validate again.',
-          ]
-
-          body = '\n'.join(lines)
-          body_file = '/tmp/setup_issue_body.md'
-          # Write the body to a temp file and pass it with --body-file to avoid any
-          # length limits or encoding issues when passing markdown as a CLI argument.
-          with open(body_file, 'w') as f:
-              f.write(body)
-
-          subprocess.run([
-              'gh', 'issue', 'create',
-              '--title', 'Setup required: rental monitor needs configuration',
-              '--body-file', body_file,
-              '--label', 'setup',
-          ], check=True)
-          PYEOF
+          gh issue create \
+            --title 'Setup required: rental monitor needs configuration' \
+            --body-file "$BODY_FILE" \
+            --label 'setup'
 
       # Print a confirmation message when every check passes so the run log clearly shows
       # the monitor is fully configured and ready for its first scheduled run.

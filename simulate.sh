@@ -11,6 +11,12 @@ set -euo pipefail
 FIXTURE="${1:-data/fixtures/sample-response.json}"
 SEEN_FILE="data/seen-listings.json"
 
+if ! command -v yq > /dev/null 2>&1; then
+  echo "ERROR: yq is required but not installed." >&2
+  echo "       Install with: brew install yq  (macOS) or snap install yq  (Linux)" >&2
+  exit 1
+fi
+
 divider() { printf '\n%s\n' "────────────────────────────────────────────────────────────────"; }
 header()  { divider; printf '▶  STEP: %s\n' "$*"; divider; }
 
@@ -18,34 +24,26 @@ header()  { divider; printf '▶  STEP: %s\n' "$*"; divider; }
 
 header "Parse config"
 
-eval "$(python3 - <<'PYEOF'
-import yaml, re as _re, shlex
+ZIP_CODE=$(yq '.zip_code' monitor-config.yml)
+BEDROOMS=$(yq '.bedrooms // "2:3"' monitor-config.yml)
 
-with open('monitor-config.yml') as f:
-    cfg = yaml.safe_load(f)
+# Escape only oniguruma metacharacters in each street name (e.g. the dot in "St. James Pl."),
+# then join with | as the alternation operator. Spaces are NOT escaped — oniguruma matches them literally.
+STREET_REGEX=$(yq '.streets[]' monitor-config.yml \
+  | sed 's/[].*+?(){}^$|\\[]/\\&/g' \
+  | tr '\n' '|' \
+  | sed 's/|$//')
 
-zip_code   = str(cfg['zip_code'])
-streets    = cfg.get('streets', [])
-price_caps = cfg.get('price_caps', {})
-bedrooms   = str(cfg.get('bedrooms', '2:3'))
-
-_ONIG_META = _re.compile(r'([.^$*+?()[\]{}|\\])')
-street_regex = '|'.join(_ONIG_META.sub(r'\\\1', str(s)) for s in streets)
-
-clauses = []
-for k, v in price_caps.items():
-    br = int(str(k).replace('br', ''))
-    clauses.append(f'(.bedrooms == {br} and .price <= {v})')
-price_filter = ' or '.join(clauses) if clauses else 'true'
-
-# shlex.quote produces a correctly shell-quoted value safe for eval.
-# repr() must NOT be used here — it double-escapes backslashes in single-quoted strings.
-print(f'ZIP_CODE={shlex.quote(zip_code)}')
-print(f'BEDROOMS={shlex.quote(bedrooms)}')
-print(f'STREET_REGEX={shlex.quote(street_regex)}')
-print(f'PRICE_FILTER={shlex.quote(price_filter)}')
-PYEOF
-)"
+# Build a jq boolean expression like (.bedrooms == 2 and .price <= 5500) or (.bedrooms == 3 ...).
+# Each price_cap key looks like "2br"; strip "br" to get the bedroom integer.
+PRICE_FILTER=''
+while IFS= read -r br_key; do
+  cap=$(yq ".price_caps.\"$br_key\"" monitor-config.yml)
+  br="${br_key%br}"
+  clause="(.bedrooms == $br and .price <= $cap)"
+  PRICE_FILTER="${PRICE_FILTER:+$PRICE_FILTER or }$clause"
+done < <(yq '.price_caps | keys | .[]' monitor-config.yml)
+[ -z "$PRICE_FILTER" ] && PRICE_FILTER='true'
 
 echo "  zip_code    : $ZIP_CODE"
 echo "  bedrooms    : $BEDROOMS"

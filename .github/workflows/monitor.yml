@@ -52,46 +52,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # Read monitor-config.yml with Python and convert its four fields into step outputs
+      # Read monitor-config.yml with yq and convert its four fields into step outputs
       # that the rest of the workflow can reference as ${{ steps.config.outputs.<name> }}.
       # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-output-parameter
       - name: Parse config
         id: config
         run: |
-          python3 - <<'PYEOF'
-          import yaml, os, re as _re
+          set -euo pipefail
 
-          # Load the YAML config file from the root of the repository.
-          with open('monitor-config.yml') as f:
-              cfg = yaml.safe_load(f)
+          ZIP_CODE=$(yq '.zip_code' monitor-config.yml)
+          BEDROOMS=$(yq '.bedrooms // "2:3"' monitor-config.yml)
 
-          zip_code   = str(cfg['zip_code'])
-          streets    = cfg.get('streets', [])
-          price_caps = cfg.get('price_caps', {})
-          bedrooms   = str(cfg.get('bedrooms', '2:3'))
-
-          # Escape only jq/oniguruma metacharacters in each street name (e.g. the dot
-          # in "St. James Pl."). Spaces are excluded from escaping because oniguruma
-          # does not reliably treat backslash-space as a literal space match.
-          _ONIG_META = _re.compile(r'([.^$*+?()[\]{}|\\])')
-          street_regex = '|'.join(_ONIG_META.sub(r'\\\1', str(s)) for s in streets)
+          # Escape only oniguruma metacharacters in each street name (e.g. the dot in
+          # "St. James Pl."), then join with | as the alternation operator.
+          # Spaces are intentionally NOT escaped — oniguruma matches them literally.
+          STREET_REGEX=$(yq '.streets[]' monitor-config.yml \
+            | sed 's/[].*+?(){}^$|\\[]/\\&/g' \
+            | tr '\n' '|' \
+            | sed 's/|$//')
 
           # Build a jq boolean expression from price_caps, e.g.
           # "(.bedrooms == 2 and .price <= 5500) or (.bedrooms == 3 and .price <= 6000)".
-          clauses = []
-          for k, v in price_caps.items():
-              br = int(str(k).replace('br', ''))
-              clauses.append(f'(.bedrooms == {br} and .price <= {v})')
-          price_filter = ' or '.join(clauses) if clauses else 'true'
+          # Each key looks like "2br"; strip "br" to get the bedroom integer.
+          PRICE_FILTER=''
+          while IFS= read -r br_key; do
+            cap=$(yq ".price_caps.\"$br_key\"" monitor-config.yml)
+            br="${br_key%br}"
+            clause="(.bedrooms == $br and .price <= $cap)"
+            PRICE_FILTER="${PRICE_FILTER:+$PRICE_FILTER or }$clause"
+          done < <(yq '.price_caps | keys | .[]' monitor-config.yml)
+          [ -z "$PRICE_FILTER" ] && PRICE_FILTER='true'
 
           # Append each value to the $GITHUB_OUTPUT file so downstream steps can read them.
           # This is GitHub Actions' standard mechanism for passing data between steps.
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-              fh.write(f'zip_code={zip_code}\n')
-              fh.write(f'bedrooms={bedrooms}\n')
-              fh.write(f'street_regex={street_regex}\n')
-              fh.write(f'price_filter={price_filter}\n')
-          PYEOF
+          {
+            echo "zip_code=$ZIP_CODE"
+            echo "bedrooms=$BEDROOMS"
+            echo "street_regex=$STREET_REGEX"
+            echo "price_filter=$PRICE_FILTER"
+          } >> "$GITHUB_OUTPUT"
 
       # Decide which ZIP code to actually use: a manual dispatch input wins; if it is
       # blank the config file's value is used instead via shell fallback syntax ${A:-B}.

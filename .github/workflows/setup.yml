@@ -1,0 +1,160 @@
+name: Setup Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'monitor-config.yml'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate monitor-config.yml
+        id: validate_config
+        run: |
+          python3 - <<'PYEOF'
+          import yaml, os, sys
+
+          errors = []
+
+          try:
+              with open('monitor-config.yml') as f:
+                  cfg = yaml.safe_load(f)
+          except Exception as e:
+              errors.append(f'Could not parse monitor-config.yml: {e}')
+              cfg = {}
+
+          if not cfg.get('zip_code'):
+              errors.append('Missing required field: `zip_code`')
+
+          streets = cfg.get('streets')
+          if not streets:
+              errors.append('Missing required field: `streets`')
+          elif not isinstance(streets, list) or len(streets) == 0:
+              errors.append('`streets` must be a non-empty list')
+
+          if not cfg.get('price_caps'):
+              errors.append('Missing required field: `price_caps`')
+          else:
+              for key in cfg['price_caps']:
+                  if not str(key).endswith('br'):
+                      errors.append(f'`price_caps` key "{key}" must end in "br" (e.g. 2br, 3br)')
+
+          if not cfg.get('bedrooms'):
+              errors.append('Missing required field: `bedrooms`')
+
+          out_file = os.environ.get('GITHUB_OUTPUT', '/dev/stdout')
+          with open(out_file, 'a') as fh:
+              fh.write(f'has_errors={"true" if errors else "false"}\n')
+              if errors:
+                  delim = 'CONFIG_ERRORS_DELIM'
+                  fh.write(f'errors<<{delim}\n')
+                  for e in errors:
+                      fh.write(f'- {e}\n')
+                  fh.write(f'{delim}\n')
+
+          for e in errors:
+              print(f'::error::{e}', file=sys.stderr)
+
+          if not errors:
+              print('Config validation passed.')
+          PYEOF
+
+      - name: Check API key
+        id: check_key
+        env:
+          RENTCAST_API_KEY: ${{ secrets.RENTCAST_API_KEY }}
+        run: |
+          if [ -z "$RENTCAST_API_KEY" ]; then
+            echo "api_key_missing=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::RENTCAST_API_KEY secret is not set"
+          else
+            echo "api_key_missing=false" >> "$GITHUB_OUTPUT"
+            echo "RENTCAST_API_KEY secret is set."
+          fi
+
+      - name: Ensure setup label exists
+        if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "setup" \
+            --color "e4e669" \
+            --description "Setup required" \
+            --force
+
+      - name: Open setup checklist issue
+        if: steps.validate_config.outputs.has_errors == 'true' || steps.check_key.outputs.api_key_missing == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG_ERRORS: ${{ steps.validate_config.outputs.errors }}
+          API_KEY_MISSING: ${{ steps.check_key.outputs.api_key_missing }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYEOF'
+          import os, subprocess
+
+          api_key_missing = os.environ.get('API_KEY_MISSING') == 'true'
+          config_errors   = os.environ.get('CONFIG_ERRORS', '').strip()
+
+          lines = [
+              '## Setup Required',
+              '',
+              'Your rental monitor needs attention before it can run.',
+              '',
+          ]
+
+          if api_key_missing:
+              lines += [
+                  '### Missing API Key',
+                  '',
+                  '- [ ] Add your Rentcast API key as a repository secret named `RENTCAST_API_KEY`',
+                  '  1. Go to **Settings → Secrets and variables → Actions → New repository secret**',
+                  '  2. Name: `RENTCAST_API_KEY`',
+                  '  3. Value: your key from [app.rentcast.io](https://app.rentcast.io/app/api)',
+                  '',
+              ]
+
+          if config_errors:
+              lines += [
+                  '### Config Errors in `monitor-config.yml`',
+                  '',
+                  config_errors,
+                  '',
+                  'Edit `monitor-config.yml` to fix these issues, then push.',
+                  '',
+              ]
+
+          lines += [
+              '---',
+              'Once all items are resolved, push a change to `monitor-config.yml` '
+              'or re-run this workflow to validate again.',
+          ]
+
+          body = '\n'.join(lines)
+          body_file = '/tmp/setup_issue_body.md'
+          with open(body_file, 'w') as f:
+              f.write(body)
+
+          subprocess.run([
+              'gh', 'issue', 'create',
+              '--title', 'Setup required: rental monitor needs configuration',
+              '--body-file', body_file,
+              '--label', 'setup',
+          ], check=True)
+          PYEOF
+
+      - name: Validation passed
+        if: steps.validate_config.outputs.has_errors == 'false' && steps.check_key.outputs.api_key_missing == 'false'
+        run: |
+          echo "All checks passed. Your rental monitor is ready to run."
+          echo "Trigger the monitor workflow manually or wait for the next scheduled run."
